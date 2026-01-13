@@ -19,8 +19,8 @@ path = "src/main.rs"
 
 [dependencies]
 # Sentinel protocol
-sentinel-agent-protocol = { path = "../sentinel/crates/agent-protocol" }
-sentinel-common = "0.1"
+sentinel-agent-protocol = "0.3"
+sentinel-common = "0.3"
 
 # Async runtime
 tokio = { version = "1.40", features = ["full", "sync"] }
