@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::UnixListener;
-use tokio::sync::RwLock;
+use std::sync::RwLock;
 use tracing::{debug, error, info, trace, warn};
 
 use sentinel_agent_protocol::v2::{
@@ -139,7 +139,7 @@ impl LuaAgent {
 
     /// Load a new Lua script from content string
     fn load_script_content(&self, script_content: &str) -> Result<()> {
-        let mut lua = self.lua.blocking_write();
+        let mut lua = self.lua.write().unwrap();
 
         // Create a new Lua state
         let new_lua = Lua::new();
@@ -158,7 +158,7 @@ impl LuaAgent {
     }
 
     fn execute_request_script(&self, event: &RequestHeadersEvent) -> Result<ScriptResult> {
-        let lua = self.lua.blocking_read();
+        let lua = self.lua.read().unwrap();
 
         // Create request table
         let request_table = lua
@@ -215,7 +215,7 @@ impl LuaAgent {
     }
 
     fn execute_response_script(&self, event: &ResponseHeadersEvent) -> Result<ScriptResult> {
-        let lua = self.lua.blocking_read();
+        let lua = self.lua.read().unwrap();
 
         // Create response table
         let response_table = lua
