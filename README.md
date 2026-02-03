@@ -5,8 +5,8 @@ Lua scripting agent for [Sentinel](https://github.com/raskell-io/sentinel) rever
 ## Features
 
 - Execute Lua scripts on request/response lifecycle events
-- Sandboxed execution with resource limits (memory, CPU, time)
-- Hot-reload of scripts without restart
+- Sandboxed execution (no filesystem or network access by default)
+- Script reload via agent protocol configure message
 - Rich standard library (JSON, crypto, HTTP utilities, regex)
 - Script metadata for routing and prioritization
 - VM pooling for performance
@@ -216,15 +216,15 @@ safety {
 
 ## Resource Limits
 
-The agent enforces strict resource limits on Lua execution:
+The agent configures these resource limits on Lua execution. **Note:** Memory and CPU instruction limits are defined but not yet enforced at runtime. Execution time is bounded by the agent protocol timeout.
 
-| Limit | Default | Description |
-|-------|---------|-------------|
-| Memory | 50MB | Maximum memory per VM |
-| Instructions | 10M | Maximum CPU instructions |
-| Execution time | 100ms | Maximum script runtime |
-| String length | 10MB | Maximum string size |
-| Table size | 10,000 | Maximum table entries |
+| Limit | Default | Status |
+|-------|---------|--------|
+| Memory | 50MB | Configured, not enforced |
+| Instructions | 10M | Configured, not enforced |
+| Execution time | 100ms | Bounded by agent timeout |
+| String length | 10MB | Configured, not enforced |
+| Table size | 10,000 | Configured, not enforced |
 
 ## Security
 
