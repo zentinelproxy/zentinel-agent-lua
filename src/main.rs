@@ -1,7 +1,7 @@
-//! Sentinel Lua Agent - Scriptable request/response filtering with Lua
+//! Zentinel Lua Agent - Scriptable request/response filtering with Lua
 //!
 //! This agent provides a Lua scripting interface for custom request/response
-//! processing in the Sentinel proxy. Supports v2 protocol with both UDS and gRPC transports.
+//! processing in the Zentinel proxy. Supports v2 protocol with both UDS and gRPC transports.
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -17,22 +17,22 @@ use tokio::net::UnixListener;
 use std::sync::RwLock;
 use tracing::{debug, error, info, trace, warn};
 
-use sentinel_agent_protocol::v2::{
+use zentinel_agent_protocol::v2::{
     AgentCapabilities, AgentFeatures, AgentHandlerV2, CounterMetric, DrainReason, GaugeMetric,
     GrpcAgentServerV2, HealthStatus, MetricsReport, ShutdownReason,
 };
-use sentinel_agent_protocol::{
+use zentinel_agent_protocol::{
     AgentResponse, AuditMetadata, EventType, HeaderOp, RequestHeadersEvent, ResponseHeadersEvent,
 };
 
 /// Command line arguments
 #[derive(Parser, Debug)]
-#[command(name = "sentinel-lua-agent")]
-#[command(about = "Lua scripting agent for Sentinel reverse proxy (v2 protocol)")]
+#[command(name = "zentinel-lua-agent")]
+#[command(about = "Lua scripting agent for Zentinel reverse proxy (v2 protocol)")]
 #[command(version)]
 struct Args {
     /// Path to Unix socket
-    #[arg(long, default_value = "/tmp/sentinel-lua.sock", env = "AGENT_SOCKET")]
+    #[arg(long, default_value = "/tmp/zentinel-lua.sock", env = "AGENT_SOCKET")]
     socket: PathBuf,
 
     /// gRPC server address (e.g., "0.0.0.0:50051")
@@ -386,7 +386,7 @@ impl LuaAgent {
 impl AgentHandlerV2 for LuaAgent {
     /// Get agent capabilities
     fn capabilities(&self) -> AgentCapabilities {
-        AgentCapabilities::new("sentinel-lua-agent", "Sentinel Lua Agent", env!("CARGO_PKG_VERSION"))
+        AgentCapabilities::new("zentinel-lua-agent", "Zentinel Lua Agent", env!("CARGO_PKG_VERSION"))
             .with_event(EventType::RequestHeaders)
             .with_event(EventType::ResponseHeaders)
             .with_features(AgentFeatures {
@@ -503,18 +503,18 @@ impl AgentHandlerV2 for LuaAgent {
         // If error rate is high, report degraded
         if total_count > 100 && error_count > total_count / 10 {
             HealthStatus::degraded(
-                "sentinel-lua-agent",
+                "zentinel-lua-agent",
                 vec!["script_execution".to_string()],
                 1.5, // 50% slower timeout for degraded state
             )
         } else {
-            HealthStatus::healthy("sentinel-lua-agent")
+            HealthStatus::healthy("zentinel-lua-agent")
         }
     }
 
     /// Get current metrics report
     fn metrics_report(&self) -> Option<MetricsReport> {
-        let mut report = MetricsReport::new("sentinel-lua-agent", 10_000);
+        let mut report = MetricsReport::new("zentinel-lua-agent", 10_000);
 
         report.counters.push(CounterMetric::new(
             "lua_requests_total",
@@ -604,7 +604,7 @@ async fn handle_uds_connection(
     stream: tokio::net::UnixStream,
     agent: Arc<LuaAgent>,
 ) -> Result<(), anyhow::Error> {
-    use sentinel_agent_protocol::v2::{
+    use zentinel_agent_protocol::v2::{
         MessageType, UdsCapabilities, UdsFeatures, UdsHandshakeResponse, UdsLimits,
     };
 
@@ -655,7 +655,7 @@ async fn handle_uds_connection(
 
     // Send handshake response
     let handshake_resp = UdsHandshakeResponse {
-        encoding: sentinel_agent_protocol::v2::UdsEncoding::Json,
+        encoding: zentinel_agent_protocol::v2::UdsEncoding::Json,
         protocol_version: 2,
         capabilities: uds_caps,
         success: true,
@@ -740,8 +740,8 @@ async fn handle_uds_connection(
 /// Read a UDS v2 message
 async fn read_uds_message<R: AsyncReadExt + Unpin>(
     reader: &mut R,
-) -> Result<(sentinel_agent_protocol::v2::MessageType, Vec<u8>), anyhow::Error> {
-    use sentinel_agent_protocol::v2::MessageType;
+) -> Result<(zentinel_agent_protocol::v2::MessageType, Vec<u8>), anyhow::Error> {
+    use zentinel_agent_protocol::v2::MessageType;
 
     // Read length (4 bytes, big-endian)
     let mut len_bytes = [0u8; 4];
@@ -780,7 +780,7 @@ async fn read_uds_message<R: AsyncReadExt + Unpin>(
 /// Write a UDS v2 message
 async fn write_uds_message<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
-    msg_type: sentinel_agent_protocol::v2::MessageType,
+    msg_type: zentinel_agent_protocol::v2::MessageType,
     payload: &[u8],
 ) -> Result<(), anyhow::Error> {
     // Write length (4 bytes, big-endian) - includes type byte
@@ -826,14 +826,14 @@ async fn main() -> Result<()> {
     let log_level = if args.verbose { "debug" } else { "info" };
     tracing_subscriber::fmt()
         .with_env_filter(format!(
-            "{}={},sentinel_agent_protocol=info",
+            "{}={},zentinel_agent_protocol=info",
             env!("CARGO_CRATE_NAME"),
             log_level
         ))
         .json()
         .init();
 
-    info!("Starting Sentinel Lua Agent (v2 protocol)");
+    info!("Starting Zentinel Lua Agent (v2 protocol)");
 
     // Create agent
     let agent = Arc::new(LuaAgent::new(args.script.clone(), args.fail_open)?);
@@ -867,7 +867,7 @@ async fn main() -> Result<()> {
 
             // Run gRPC server in main task
             let grpc_server = GrpcAgentServerV2::new(
-                "sentinel-lua-agent",
+                "zentinel-lua-agent",
                 Box::new(LuaAgentWrapper(grpc_agent)),
             );
             grpc_server.run(grpc_addr).await?;
@@ -950,7 +950,7 @@ mod tests {
         headers.insert("Host".to_string(), vec!["example.com".to_string()]);
 
         let event = RequestHeadersEvent {
-            metadata: sentinel_agent_protocol::RequestMetadata {
+            metadata: zentinel_agent_protocol::RequestMetadata {
                 correlation_id: "test-123".to_string(),
                 request_id: "req-456".to_string(),
                 client_ip: "127.0.0.1".to_string(),
@@ -996,7 +996,7 @@ mod tests {
         headers.insert("Host".to_string(), vec!["example.com".to_string()]);
 
         let event = RequestHeadersEvent {
-            metadata: sentinel_agent_protocol::RequestMetadata {
+            metadata: zentinel_agent_protocol::RequestMetadata {
                 correlation_id: "test-123".to_string(),
                 request_id: "req-456".to_string(),
                 client_ip: "127.0.0.1".to_string(),
@@ -1041,7 +1041,7 @@ mod tests {
         headers.insert("Host".to_string(), vec!["example.com".to_string()]);
 
         let event = RequestHeadersEvent {
-            metadata: sentinel_agent_protocol::RequestMetadata {
+            metadata: zentinel_agent_protocol::RequestMetadata {
                 correlation_id: "test-123".to_string(),
                 request_id: "req-456".to_string(),
                 client_ip: "127.0.0.1".to_string(),
@@ -1081,7 +1081,7 @@ mod tests {
         let agent = LuaAgent::new(script.path().to_path_buf(), false).unwrap();
         let caps = agent.capabilities();
 
-        assert_eq!(caps.agent_id, "sentinel-lua-agent");
+        assert_eq!(caps.agent_id, "zentinel-lua-agent");
         assert!(caps.supports_event(EventType::RequestHeaders));
         assert!(caps.supports_event(EventType::ResponseHeaders));
         assert!(caps.features.config_push);
@@ -1120,7 +1120,7 @@ mod tests {
 
         assert!(metrics.is_some());
         let report = metrics.unwrap();
-        assert_eq!(report.agent_id, "sentinel-lua-agent");
+        assert_eq!(report.agent_id, "zentinel-lua-agent");
         assert!(!report.counters.is_empty());
         assert!(!report.gauges.is_empty());
     }

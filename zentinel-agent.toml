@@ -1,0 +1,24 @@
+# Zentinel Agent Registry Manifest
+# Lua Agent - Custom scripting with Lua
+
+[agent]
+name = "zentinel-agent-lua"
+version = "0.1.0"
+description = "Lua scripting agent for Zentinel reverse proxy - custom logic via Lua scripts"
+authors = ["Zentinel Contributors"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/zentinelproxy/zentinel-agent-lua"
+
+[protocol]
+version = "0.1"
+events = ["request_headers", "request_body", "response_headers", "response_body"]
+
+[compatibility]
+zentinel-proxy = ">=0.1.0"
+zentinel-agent-protocol = "0.1"
+
+[registry]
+homepage = "https://zentinelproxy.io/agents/lua"
+documentation = "https://zentinelproxy.io/docs/agents/lua"
+keywords = ["zentinel", "agent", "lua", "scripting", "custom"]
+categories = ["custom"]

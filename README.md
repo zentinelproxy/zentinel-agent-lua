@@ -1,6 +1,6 @@
-# sentinel-agent-lua
+# zentinel-agent-lua
 
-Lua scripting agent for [Sentinel](https://github.com/raskell-io/sentinel) reverse proxy. Write custom request/response processing logic in Lua.
+Lua scripting agent for [Zentinel](https://github.com/zentinelproxy/zentinel) reverse proxy. Write custom request/response processing logic in Lua.
 
 ## Features
 
@@ -16,30 +16,30 @@ Lua scripting agent for [Sentinel](https://github.com/raskell-io/sentinel) rever
 ### From crates.io
 
 ```bash
-cargo install sentinel-agent-lua
+cargo install zentinel-agent-lua
 ```
 
 ### From source
 
 ```bash
-git clone https://github.com/raskell-io/sentinel-agent-lua
-cd sentinel-agent-lua
+git clone https://github.com/zentinelproxy/zentinel-agent-lua
+cd zentinel-agent-lua
 cargo build --release
 ```
 
 ## Usage
 
 ```bash
-sentinel-lua-agent --socket /var/run/sentinel/lua.sock \
-  --scripts /etc/sentinel/scripts
+zentinel-lua-agent --socket /var/run/zentinel/lua.sock \
+  --scripts /etc/zentinel/scripts
 ```
 
 ### Command Line Options
 
 | Option | Environment Variable | Description | Default |
 |--------|---------------------|-------------|---------|
-| `--socket` | `AGENT_SOCKET` | Unix socket path | `/tmp/sentinel-lua.sock` |
-| `--scripts` | `LUA_SCRIPTS_DIR` | Scripts directory | `/etc/sentinel/scripts` |
+| `--socket` | `AGENT_SOCKET` | Unix socket path | `/tmp/zentinel-lua.sock` |
+| `--scripts` | `LUA_SCRIPTS_DIR` | Scripts directory | `/etc/zentinel/scripts` |
 | `--config` | `LUA_CONFIG` | Configuration file | - |
 | `--log-level` | `RUST_LOG` | Log level | `info` |
 
@@ -62,11 +62,11 @@ function on_request_headers(request)
     -- Check authorization
     local auth = request:get_header("Authorization")
     if not auth then
-        sentinel.set_decision("block")
+        zentinel.set_decision("block")
         return
     end
 
-    sentinel.set_decision("allow")
+    zentinel.set_decision("allow")
 end
 ```
 
@@ -154,24 +154,24 @@ local formatted = time.format(now, "%Y-%m-%d")
 local ts = time.parse("2024-01-01", "%Y-%m-%d")
 ```
 
-#### Sentinel
+#### Zentinel
 ```lua
-sentinel.log("info", "message")
-sentinel.set_decision("allow")   -- or "block", "redirect"
-sentinel.add_metadata("key", "value")
-sentinel.version                 -- Agent version
+zentinel.log("info", "message")
+zentinel.set_decision("allow")   -- or "block", "redirect"
+zentinel.add_metadata("key", "value")
+zentinel.version                 -- Agent version
 ```
 
 ## Configuration
 
-### Sentinel Proxy Configuration
+### Zentinel Proxy Configuration
 
 ```kdl
 agents {
     agent "lua" {
         type "custom"
         transport "unix_socket" {
-            path "/var/run/sentinel/lua.sock"
+            path "/var/run/zentinel/lua.sock"
         }
         events ["request_headers", "response_headers"]
         timeout-ms 100
@@ -183,10 +183,10 @@ agents {
 ### Agent Configuration (KDL)
 
 ```kdl
-socket-path "/var/run/sentinel/lua.sock"
+socket-path "/var/run/zentinel/lua.sock"
 
 scripts {
-    directory "/etc/sentinel/scripts"
+    directory "/etc/zentinel/scripts"
     hot-reload true
     watch-interval 5
     timeout 100

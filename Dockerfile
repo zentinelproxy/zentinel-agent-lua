@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.4
 
-# Sentinel Lua Agent Container Image
+# Zentinel Lua Agent Container Image
 #
 # Targets:
 #   - prebuilt: For CI with pre-built binaries
@@ -10,16 +10,16 @@
 ################################################################################
 FROM gcr.io/distroless/cc-debian12:nonroot AS prebuilt
 
-COPY sentinel-lua-agent /sentinel-lua-agent
+COPY zentinel-lua-agent /zentinel-lua-agent
 
-LABEL org.opencontainers.image.title="Sentinel Lua Agent" \
-      org.opencontainers.image.description="Sentinel Lua Agent for Sentinel reverse proxy" \
+LABEL org.opencontainers.image.title="Zentinel Lua Agent" \
+      org.opencontainers.image.description="Zentinel Lua Agent for Zentinel reverse proxy" \
       org.opencontainers.image.vendor="Raskell" \
-      org.opencontainers.image.source="https://github.com/raskell-io/sentinel-agent-lua"
+      org.opencontainers.image.source="https://github.com/zentinelproxy/zentinel-agent-lua"
 
-ENV RUST_LOG=info,sentinel_lua_agent=debug \
-    SOCKET_PATH=/var/run/sentinel/lua.sock
+ENV RUST_LOG=info,zentinel_lua_agent=debug \
+    SOCKET_PATH=/var/run/zentinel/lua.sock
 
 USER nonroot:nonroot
 
-ENTRYPOINT ["/sentinel-lua-agent"]
+ENTRYPOINT ["/zentinel-lua-agent"]

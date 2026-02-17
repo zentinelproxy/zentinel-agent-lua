@@ -1,26 +1,26 @@
 [package]
-name = "sentinel-agent-lua"
+name = "zentinel-agent-lua"
 version = "0.2.0"
 edition = "2021"
 rust-version = "1.75"
-authors = ["Sentinel Contributors"]
+authors = ["Zentinel Contributors"]
 license = "Apache-2.0"
-repository = "https://github.com/raskell-io/sentinel-agent-lua"
-homepage = "https://sentinel.raskell.io"
-documentation = "https://sentinel.raskell.io/docs/agents/lua"
-description = "Lua scripting agent for Sentinel reverse proxy - custom logic via Lua scripts"
+repository = "https://github.com/zentinelproxy/zentinel-agent-lua"
+homepage = "https://zentinelproxy.io"
+documentation = "https://zentinelproxy.io/docs/agents/lua"
+description = "Lua scripting agent for Zentinel reverse proxy - custom logic via Lua scripts"
 keywords = ["proxy", "reverse-proxy", "agent", "lua", "scripting"]
 categories = ["network-programming"]
 readme = "README.md"
 
 [[bin]]
-name = "sentinel-lua-agent"
+name = "zentinel-lua-agent"
 path = "src/main.rs"
 
 [dependencies]
-# Sentinel protocol (local path for development)
-sentinel-agent-protocol = { path = "../sentinel/crates/agent-protocol" }
-sentinel-common = { path = "../sentinel/crates/common" }
+# Zentinel protocol (local path for development)
+zentinel-agent-protocol = { path = "../zentinel/crates/agent-protocol" }
+zentinel-common = { path = "../zentinel/crates/common" }
 
 # Async runtime
 tokio = { version = "1.40", features = ["full", "sync"] }
