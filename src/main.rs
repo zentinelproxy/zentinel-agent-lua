@@ -50,6 +50,14 @@ struct Args {
     /// Fail open on script errors
     #[arg(long, env = "FAIL_OPEN")]
     fail_open: bool,
+
+    /// Maximum memory in megabytes for the Lua runtime (default: 64)
+    #[arg(long, default_value = "64", env = "LUA_MAX_MEMORY_MB")]
+    max_memory_mb: usize,
+
+    /// Maximum instructions per script execution (0 = unlimited, default: 1000000)
+    #[arg(long, default_value = "1000000", env = "LUA_MAX_INSTRUCTIONS")]
+    max_instructions: u32,
 }
 
 /// Lua script result
@@ -105,6 +113,10 @@ pub struct LuaAgent {
     #[allow(dead_code)]
     script_path: PathBuf,
     fail_open: bool,
+    /// Memory limit in bytes
+    memory_limit: usize,
+    /// Max instructions per execution (0 = unlimited)
+    max_instructions: u32,
     /// Metrics counters
     requests_total: AtomicU64,
     requests_blocked: AtomicU64,
@@ -114,7 +126,20 @@ pub struct LuaAgent {
 
 impl LuaAgent {
     pub fn new(script_path: PathBuf, fail_open: bool) -> Result<Self> {
+        Self::with_limits(script_path, fail_open, 64 * 1024 * 1024, 1_000_000)
+    }
+
+    pub fn with_limits(
+        script_path: PathBuf,
+        fail_open: bool,
+        memory_limit: usize,
+        max_instructions: u32,
+    ) -> Result<Self> {
         let lua = Lua::new();
+
+        // Set memory limit
+        lua.set_memory_limit(memory_limit)?;
+        info!(memory_limit_mb = memory_limit / (1024 * 1024), "Lua memory limit set");
 
         // Load the script
         let script_content = std::fs::read_to_string(&script_path)
@@ -130,6 +155,8 @@ impl LuaAgent {
             lua: Arc::new(RwLock::new(lua)),
             script_path,
             fail_open,
+            memory_limit,
+            max_instructions,
             requests_total: AtomicU64::new(0),
             requests_blocked: AtomicU64::new(0),
             requests_allowed: AtomicU64::new(0),
@@ -144,6 +171,9 @@ impl LuaAgent {
         // Create a new Lua state
         let new_lua = Lua::new();
 
+        // Reapply memory limit
+        new_lua.set_memory_limit(self.memory_limit)?;
+
         // Load the script
         new_lua
             .load(script_content)
@@ -157,8 +187,39 @@ impl LuaAgent {
         Ok(())
     }
 
+    /// Set instruction count hook for CPU limiting.
+    fn set_instruction_hook(&self, lua: &Lua) {
+        if self.max_instructions == 0 {
+            return;
+        }
+        let max = self.max_instructions;
+        let counter = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counter_clone = counter.clone();
+        lua.set_hook(
+            mlua::HookTriggers::new().every_nth_instruction(1000),
+            move |_lua, _debug| {
+                let count = counter_clone.fetch_add(1000, std::sync::atomic::Ordering::Relaxed);
+                if count >= max {
+                    Err(mlua::Error::RuntimeError(
+                        "Script exceeded instruction limit".to_string(),
+                    ))
+                } else {
+                    Ok(mlua::VmState::Continue)
+                }
+            },
+        );
+    }
+
+    /// Remove instruction hook after execution.
+    fn remove_instruction_hook(&self, lua: &Lua) {
+        lua.remove_hook();
+    }
+
     fn execute_request_script(&self, event: &RequestHeadersEvent) -> Result<ScriptResult> {
         let lua = self.lua.read().unwrap();
+
+        // Set instruction limit hook
+        self.set_instruction_hook(&lua);
 
         // Create request table
         let request_table = lua
@@ -200,22 +261,32 @@ impl LuaAgent {
         // Call on_request_headers if it exists
         let func: Option<LuaFunction> = lua.globals().get("on_request_headers").ok();
 
-        if let Some(func) = func {
+        let result = if let Some(func) = func {
             let result: LuaValue = func
                 .call(())
                 .map_err(|e| anyhow::anyhow!("Lua error: {}", e))?;
 
             // Parse result
             if let LuaValue::Table(result_table) = result {
-                return self.parse_script_result(&lua, result_table);
+                self.parse_script_result(&lua, result_table)
+            } else {
+                Ok(ScriptResult::default())
             }
-        }
+        } else {
+            Ok(ScriptResult::default())
+        };
 
-        Ok(ScriptResult::default())
+        // Remove instruction hook after execution
+        self.remove_instruction_hook(&lua);
+
+        result
     }
 
     fn execute_response_script(&self, event: &ResponseHeadersEvent) -> Result<ScriptResult> {
         let lua = self.lua.read().unwrap();
+
+        // Set instruction limit hook
+        self.set_instruction_hook(&lua);
 
         // Create response table
         let response_table = lua
@@ -250,17 +321,24 @@ impl LuaAgent {
         // Call on_response_headers if it exists
         let func: Option<LuaFunction> = lua.globals().get("on_response_headers").ok();
 
-        if let Some(func) = func {
+        let result = if let Some(func) = func {
             let result: LuaValue = func
                 .call(())
                 .map_err(|e| anyhow::anyhow!("Lua error: {}", e))?;
 
             if let LuaValue::Table(result_table) = result {
-                return self.parse_script_result(&lua, result_table);
+                self.parse_script_result(&lua, result_table)
+            } else {
+                Ok(ScriptResult::default())
             }
-        }
+        } else {
+            Ok(ScriptResult::default())
+        };
 
-        Ok(ScriptResult::default())
+        // Remove instruction hook after execution
+        self.remove_instruction_hook(&lua);
+
+        result
     }
 
     fn parse_script_result(&self, _lua: &Lua, table: LuaTable) -> Result<ScriptResult> {
@@ -835,12 +913,20 @@ async fn main() -> Result<()> {
 
     info!("Starting Zentinel Lua Agent (v2 protocol)");
 
-    // Create agent
-    let agent = Arc::new(LuaAgent::new(args.script.clone(), args.fail_open)?);
+    // Create agent with resource limits
+    let memory_limit = args.max_memory_mb * 1024 * 1024;
+    let agent = Arc::new(LuaAgent::with_limits(
+        args.script.clone(),
+        args.fail_open,
+        memory_limit,
+        args.max_instructions,
+    )?);
 
     info!(
         script = ?args.script,
         fail_open = args.fail_open,
+        max_memory_mb = args.max_memory_mb,
+        max_instructions = args.max_instructions,
         "Configuration loaded"
     );
 
