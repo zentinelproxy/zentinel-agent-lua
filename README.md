@@ -170,10 +170,8 @@ zentinel.version                 -- Agent version
 agents {
     agent "lua" {
         type "custom"
-        transport "unix_socket" {
-            path "/var/run/zentinel/lua.sock"
-        }
-        events ["request_headers", "response_headers"]
+        unix-socket "/var/run/zentinel/lua.sock"
+        events "request_headers" "response_headers"
         timeout-ms 100
         failure-mode "open"
     }
