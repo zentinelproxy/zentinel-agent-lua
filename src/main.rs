@@ -137,7 +137,10 @@ impl LuaAgent {
 
         // Set memory limit
         lua.set_memory_limit(memory_limit)?;
-        info!(memory_limit_mb = memory_limit / (1024 * 1024), "Lua memory limit set");
+        info!(
+            memory_limit_mb = memory_limit / (1024 * 1024),
+            "Lua memory limit set"
+        );
 
         // Load the script
         let script_content = std::fs::read_to_string(&script_path)
@@ -462,20 +465,24 @@ impl LuaAgent {
 impl AgentHandlerV2 for LuaAgent {
     /// Get agent capabilities
     fn capabilities(&self) -> AgentCapabilities {
-        AgentCapabilities::new("zentinel-lua-agent", "Zentinel Lua Agent", env!("CARGO_PKG_VERSION"))
-            .with_event(EventType::RequestHeaders)
-            .with_event(EventType::ResponseHeaders)
-            .with_features(AgentFeatures {
-                streaming_body: false,
-                websocket: false,
-                guardrails: false,
-                config_push: true,
-                metrics_export: true,
-                concurrent_requests: 100,
-                cancellation: false,
-                flow_control: false,
-                health_reporting: true,
-            })
+        AgentCapabilities::new(
+            "zentinel-lua-agent",
+            "Zentinel Lua Agent",
+            env!("CARGO_PKG_VERSION"),
+        )
+        .with_event(EventType::RequestHeaders)
+        .with_event(EventType::ResponseHeaders)
+        .with_features(AgentFeatures {
+            streaming_body: false,
+            websocket: false,
+            guardrails: false,
+            config_push: true,
+            metrics_export: true,
+            concurrent_requests: 100,
+            cancellation: false,
+            flow_control: false,
+            health_reporting: true,
+        })
     }
 
     /// Handle configuration update
@@ -702,10 +709,8 @@ async fn main() -> Result<()> {
             });
 
             // Run gRPC server in main task
-            let grpc_server = GrpcAgentServerV2::new(
-                "zentinel-lua-agent",
-                Box::new(LuaAgentWrapper(grpc_agent)),
-            );
+            let grpc_server =
+                GrpcAgentServerV2::new("zentinel-lua-agent", Box::new(LuaAgentWrapper(grpc_agent)));
             grpc_server.run(grpc_addr).await?;
 
             uds_handle.abort();
