@@ -13,13 +13,25 @@ Lua scripting agent for [Zentinel](https://github.com/zentinelproxy/zentinel) re
 
 ## Installation
 
-### From crates.io
+### Using Bundle (Recommended)
+
+```bash
+# Install just this agent
+zentinel bundle install lua
+
+# Or install all bundled agents
+zentinel bundle install
+```
+
+The bundle command downloads the correct binary for your platform and places it in the standard location. See the [bundle documentation](https://zentinelproxy.io/docs/deployment/bundle/) for details.
+
+### Using Cargo
 
 ```bash
 cargo install zentinel-agent-lua
 ```
 
-### From source
+### From Source
 
 ```bash
 git clone https://github.com/zentinelproxy/zentinel-agent-lua
@@ -185,7 +197,7 @@ socket-path "/var/run/zentinel/lua.sock"
 
 scripts {
     directory "/etc/zentinel/scripts"
-    hot-reload true
+    hot-reload #true
     watch-interval 5
     timeout 100
     cache-size 200
@@ -201,13 +213,13 @@ resource-limits {
     max-memory 52428800      // 50MB
     max-instructions 10000000
     max-execution-time 200
-    allow-filesystem false
-    allow-network false
+    allow-filesystem #false
+    allow-network #false
 }
 
 safety {
-    fail-open true
-    debug-scripts false
+    fail-open #true
+    debug-scripts #false
     max-concurrent 200
 }
 ```

@@ -12,14 +12,12 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
-use tokio::net::UnixListener;
 use std::sync::RwLock;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, warn};
 
 use zentinel_agent_protocol::v2::{
     AgentCapabilities, AgentFeatures, AgentHandlerV2, CounterMetric, DrainReason, GaugeMetric,
-    GrpcAgentServerV2, HealthStatus, MetricsReport, ShutdownReason,
+    GrpcAgentServerV2, HealthStatus, MetricsReport, ShutdownReason, UdsAgentServerV2,
 };
 use zentinel_agent_protocol::{
     AgentResponse, AuditMetadata, EventType, HeaderOp, RequestHeadersEvent, ResponseHeadersEvent,
@@ -642,259 +640,6 @@ impl AgentHandlerV2 for LuaAgent {
     }
 }
 
-/// UDS v2 server for the Lua agent
-async fn run_uds_server(
-    socket_path: PathBuf,
-    agent: Arc<LuaAgent>,
-) -> Result<(), anyhow::Error> {
-
-    // Remove existing socket file if it exists
-    if socket_path.exists() {
-        trace!(socket_path = %socket_path.display(), "Removing existing socket file");
-        std::fs::remove_file(&socket_path)?;
-    }
-
-    // Create Unix socket listener
-    let listener = UnixListener::bind(&socket_path)?;
-
-    info!(socket_path = %socket_path.display(), "UDS v2 agent server listening");
-
-    loop {
-        match listener.accept().await {
-            Ok((stream, _addr)) => {
-                trace!("Accepted new UDS connection");
-                let agent = Arc::clone(&agent);
-                tokio::spawn(async move {
-                    if let Err(e) = handle_uds_connection(stream, agent).await {
-                        error!(error = %e, "Error handling UDS connection");
-                    }
-                });
-            }
-            Err(e) => {
-                error!(error = %e, "Failed to accept UDS connection");
-            }
-        }
-    }
-}
-
-/// Handle a single UDS connection with v2 protocol
-async fn handle_uds_connection(
-    stream: tokio::net::UnixStream,
-    agent: Arc<LuaAgent>,
-) -> Result<(), anyhow::Error> {
-    use zentinel_agent_protocol::v2::{
-        MessageType, UdsCapabilities, UdsFeatures, UdsHandshakeResponse, UdsLimits,
-    };
-
-    let (read_half, write_half) = stream.into_split();
-    let mut reader = BufReader::new(read_half);
-    let mut writer = BufWriter::new(write_half);
-
-    // Read handshake request
-    let (msg_type, payload) = read_uds_message(&mut reader).await?;
-    if msg_type != MessageType::HandshakeRequest {
-        return Err(anyhow::anyhow!(
-            "Expected HandshakeRequest, got {:?}",
-            msg_type
-        ));
-    }
-
-    // Parse handshake request (validates JSON structure)
-    let _: serde_json::Value = serde_json::from_slice(&payload)?;
-
-    // Build capabilities
-    let caps = agent.capabilities();
-    let uds_caps = UdsCapabilities {
-        agent_id: caps.agent_id.clone(),
-        name: caps.name.clone(),
-        version: caps.version.clone(),
-        supported_events: caps
-            .supported_events
-            .iter()
-            .map(|e| event_type_to_i32(*e))
-            .collect(),
-        features: UdsFeatures {
-            streaming_body: caps.features.streaming_body,
-            websocket: caps.features.websocket,
-            guardrails: caps.features.guardrails,
-            config_push: caps.features.config_push,
-            metrics_export: caps.features.metrics_export,
-            concurrent_requests: caps.features.concurrent_requests,
-            cancellation: caps.features.cancellation,
-            flow_control: caps.features.flow_control,
-            health_reporting: caps.features.health_reporting,
-        },
-        limits: UdsLimits {
-            max_body_size: caps.limits.max_body_size as u64,
-            max_concurrency: caps.limits.max_concurrency,
-            preferred_chunk_size: caps.limits.preferred_chunk_size as u64,
-        },
-    };
-
-    // Send handshake response
-    let handshake_resp = UdsHandshakeResponse {
-        encoding: zentinel_agent_protocol::v2::UdsEncoding::Json,
-        protocol_version: 2,
-        capabilities: uds_caps,
-        success: true,
-        error: None,
-    };
-
-    let resp_bytes = serde_json::to_vec(&handshake_resp)?;
-    write_uds_message(&mut writer, MessageType::HandshakeResponse, &resp_bytes).await?;
-
-    trace!("UDS v2 handshake complete");
-
-    // Main event loop
-    loop {
-        let (msg_type, payload) = match read_uds_message(&mut reader).await {
-            Ok(m) => m,
-            Err(e) => {
-                if e.to_string().contains("UnexpectedEof") || e.to_string().contains("connection") {
-                    trace!("UDS client disconnected");
-                    return Ok(());
-                }
-                return Err(e);
-            }
-        };
-
-        let response_bytes = match msg_type {
-            MessageType::RequestHeaders => {
-                let event: RequestHeadersEvent = serde_json::from_slice(&payload)?;
-                let response = agent.on_request_headers(event).await;
-                serde_json::to_vec(&response)?
-            }
-            MessageType::ResponseHeaders => {
-                let event: ResponseHeadersEvent = serde_json::from_slice(&payload)?;
-                let response = agent.on_response_headers(event).await;
-                serde_json::to_vec(&response)?
-            }
-            MessageType::Configure => {
-                #[derive(Deserialize)]
-                struct ConfigMsg {
-                    config: serde_json::Value,
-                    version: Option<String>,
-                }
-                let config_msg: ConfigMsg = serde_json::from_slice(&payload)?;
-                let success = agent.on_configure(config_msg.config, config_msg.version).await;
-                serde_json::to_vec(&serde_json::json!({ "success": success }))?
-            }
-            MessageType::Ping => {
-                #[derive(Deserialize)]
-                struct Ping {
-                    sequence: u64,
-                    timestamp_ms: u64,
-                }
-                let ping: Ping = serde_json::from_slice(&payload)?;
-                let pong = serde_json::json!({
-                    "sequence": ping.sequence,
-                    "ping_timestamp_ms": ping.timestamp_ms,
-                    "timestamp_ms": now_ms(),
-                });
-                let pong_bytes = serde_json::to_vec(&pong)?;
-                write_uds_message(&mut writer, MessageType::Pong, &pong_bytes).await?;
-                continue;
-            }
-            MessageType::HealthStatus => {
-                // Proxy requesting health status
-                let health = agent.health_status();
-                serde_json::to_vec(&health)?
-            }
-            MessageType::MetricsReport => {
-                // Proxy requesting metrics
-                let metrics = agent.metrics_report();
-                serde_json::to_vec(&metrics)?
-            }
-            _ => {
-                trace!(?msg_type, "Received unhandled message type");
-                continue;
-            }
-        };
-
-        write_uds_message(&mut writer, MessageType::AgentResponse, &response_bytes).await?;
-    }
-}
-
-/// Read a UDS v2 message
-async fn read_uds_message<R: AsyncReadExt + Unpin>(
-    reader: &mut R,
-) -> Result<(zentinel_agent_protocol::v2::MessageType, Vec<u8>), anyhow::Error> {
-    use zentinel_agent_protocol::v2::MessageType;
-
-    // Read length (4 bytes, big-endian)
-    let mut len_bytes = [0u8; 4];
-    reader.read_exact(&mut len_bytes).await?;
-    let total_len = u32::from_be_bytes(len_bytes) as usize;
-
-    if total_len == 0 {
-        return Err(anyhow::anyhow!("Zero-length message"));
-    }
-
-    const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
-    if total_len > MAX_MESSAGE_SIZE {
-        return Err(anyhow::anyhow!(
-            "Message too large: {} > {}",
-            total_len,
-            MAX_MESSAGE_SIZE
-        ));
-    }
-
-    // Read message type (1 byte)
-    let mut type_byte = [0u8; 1];
-    reader.read_exact(&mut type_byte).await?;
-    let msg_type = MessageType::try_from(type_byte[0])
-        .map_err(|e| anyhow::anyhow!("Invalid message type: {}", e))?;
-
-    // Read payload
-    let payload_len = total_len - 1;
-    let mut payload = vec![0u8; payload_len];
-    if payload_len > 0 {
-        reader.read_exact(&mut payload).await?;
-    }
-
-    Ok((msg_type, payload))
-}
-
-/// Write a UDS v2 message
-async fn write_uds_message<W: AsyncWriteExt + Unpin>(
-    writer: &mut W,
-    msg_type: zentinel_agent_protocol::v2::MessageType,
-    payload: &[u8],
-) -> Result<(), anyhow::Error> {
-    // Write length (4 bytes, big-endian) - includes type byte
-    let total_len = (payload.len() + 1) as u32;
-    writer.write_all(&total_len.to_be_bytes()).await?;
-
-    // Write message type (1 byte)
-    writer.write_all(&[msg_type as u8]).await?;
-
-    // Write payload
-    writer.write_all(payload).await?;
-    writer.flush().await?;
-
-    Ok(())
-}
-
-fn event_type_to_i32(event_type: EventType) -> i32 {
-    match event_type {
-        EventType::Configure => 0,
-        EventType::RequestHeaders => 1,
-        EventType::RequestBodyChunk => 2,
-        EventType::ResponseHeaders => 3,
-        EventType::ResponseBodyChunk => 4,
-        EventType::RequestComplete => 5,
-        EventType::WebSocketFrame => 6,
-        EventType::GuardrailInspect => 7,
-    }
-}
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     // Parse command line arguments
@@ -946,7 +691,12 @@ async fn main() -> Result<()> {
 
             // Spawn UDS server
             let uds_handle = tokio::spawn(async move {
-                if let Err(e) = run_uds_server(socket_path, uds_agent).await {
+                let server = UdsAgentServerV2::new(
+                    "zentinel-lua-agent",
+                    socket_path,
+                    Box::new(LuaAgentWrapper(uds_agent)),
+                );
+                if let Err(e) = server.run().await {
                     error!(error = %e, "UDS server error");
                 }
             });
@@ -963,7 +713,12 @@ async fn main() -> Result<()> {
         None => {
             // Run only UDS server
             info!(socket = ?args.socket, "Starting agent with UDS (v2 protocol)");
-            run_uds_server(args.socket, agent).await?;
+            let server = UdsAgentServerV2::new(
+                "zentinel-lua-agent",
+                args.socket,
+                Box::new(LuaAgentWrapper(agent)),
+            );
+            server.run().await?;
         }
     }
 
