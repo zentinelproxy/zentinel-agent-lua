@@ -1,55 +1,116 @@
-# zentinel-agent-lua
+<p align="center">
+  <a href="https://zentinelproxy.io">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/zentinelproxy/design/main/marks/lockup/zentinel-lockup-dark.svg">
+      <img alt="Zentinel" src="https://raw.githubusercontent.com/zentinelproxy/design/main/marks/lockup/zentinel-lockup-light.svg" height="52">
+    </picture>
+  </a>
+</p>
 
-Lua scripting agent for [Zentinel](https://github.com/zentinelproxy/zentinel) reverse proxy. Write custom request/response processing logic in Lua.
+<h3 align="center">Lua agent</h3>
 
-## Features
+<p align="center">Runs one Lua 5.4 script on request and response headers to allow, block, redirect or rewrite headers.</p>
 
-- Execute Lua scripts on request/response lifecycle events
-- Sandboxed execution (no filesystem or network access by default)
-- Script reload via agent protocol configure message
-- Rich standard library (JSON, crypto, HTTP utilities, regex)
-- Script metadata for routing and prioritization
-- VM pooling for performance
+<p align="center">
+  <a href="https://github.com/zentinelproxy/zentinel-agent-lua/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/zentinelproxy/zentinel-agent-lua/actions/workflows/ci.yml/badge.svg"></a>
+  <img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-9b4d8a?style=flat&labelColor=1f161e">
+  <img alt="Rust: 1.94.1+" src="https://img.shields.io/badge/rust-1.94.1%2B-f68d31?style=flat&labelColor=1f161e&logo=rust&logoColor=white">
+  <img alt="Agent protocol: v2" src="https://img.shields.io/badge/agent%20protocol-v2-f68d31?style=flat&labelColor=1f161e">
+</p>
 
-## Installation
+<p align="center">
+  <a href="https://registry.zentinelproxy.io/lua/">Registry</a> &middot;
+  <a href="https://docs.zentinelproxy.io">Docs</a> &middot;
+  <a href="https://github.com/zentinelproxy">All repositories</a>
+</p>
 
-### Using Bundle (Recommended)
+For request logic that is too specific for a built-in filter and too small
+for a compiled agent. The agent loads one script at startup, sets a global
+`request` (or `response`) table and calls the script's `on_request_headers()`
+or `on_response_headers()`; the table it returns becomes the decision. A
+function the script does not define allows. A script error blocks with `500`
+unless the agent runs with `--fail-open`; if the agent itself is unreachable,
+the filter's `failure-mode` decides.
+
+The script runs with Lua's standard libraries, including `io` and `os`. It is
+not sandboxed: treat it as code with the agent's privileges.
+
+## Quick start
 
 ```bash
-# Install just this agent
 zentinel bundle install lua
 
-# Or install all bundled agents
-zentinel bundle install
+cat > handler.lua <<'EOF'
+function on_request_headers()
+    if request.uri:sub(1, 6) == "/admin" then
+        return { decision = "block", status = 403, body = "Forbidden" }
+    end
+    return { decision = "allow", add_request_headers = { ["X-Processed-By"] = "lua-agent" } }
+end
+EOF
+
+zentinel-lua-agent --script handler.lua --socket /var/run/zentinel/lua.sock
 ```
 
-The bundle command downloads the correct binary for your platform and places it in the standard location. See the [bundle documentation](https://docs.zentinelproxy.io/deployment/bundle/) for details.
+```kdl
+system {
+    worker-threads 0
+}
 
-### Using Cargo
+listeners {
+    listener "http" {
+        address "127.0.0.1:8080"
+        protocol "http"
+    }
+}
 
-Not supported. `zentinel-agent-lua` is not published on crates.io, and it depends on
-`zentinel-agent-protocol` through a path dependency, so neither
-`cargo install zentinel-agent-lua` nor `cargo install --git` works. Use a prebuilt
-binary or build from source (below).
+agents {
+    agent "lua" type="custom" {
+        unix-socket "/var/run/zentinel/lua.sock"
+        events "request_headers" "response_headers"
+        timeout-ms 100
+    }
+}
 
-### Prebuilt Binaries
+filters {
+    filter "lua" {
+        type "agent"
+        agent "lua"
+        failure-mode "closed"
+    }
+}
 
-Each [release](https://github.com/zentinelproxy/zentinel-agent-lua/releases) ships binaries
-for `linux-x86_64`, `linux-aarch64`, and `darwin-aarch64`:
+routes {
+    route "default" {
+        matches {
+            path-prefix "/"
+        }
+        upstream "backend"
+        filters "lua"
+    }
+}
+
+upstreams {
+    upstream "backend" {
+        target "127.0.0.1:3000"
+    }
+}
+```
+
+## Install
 
 ```bash
-VERSION=0.3.0
-PLATFORM=linux-x86_64   # or linux-aarch64, darwin-aarch64
-curl -fsSL -o zentinel-lua-agent.tar.gz \
-  "https://github.com/zentinelproxy/zentinel-agent-lua/releases/download/v${VERSION}/zentinel-lua-agent-${VERSION}-${PLATFORM}.tar.gz"
-tar -xzf zentinel-lua-agent.tar.gz
-sudo install -m 0755 zentinel-lua-agent /usr/local/bin/
+zentinel bundle install lua
 ```
 
-### From Source
+Release binaries (`zentinel-lua-agent-<version>-<platform>.tar.gz`) for
+`linux-x86_64`, `linux-aarch64` and `darwin-aarch64` are on the
+[releases page](https://github.com/zentinelproxy/zentinel-agent-lua/releases).
 
-Building from source requires the [zentinel](https://github.com/zentinelproxy/zentinel) repository checked out
-**next to** this one, because `zentinel-agent-protocol` is a path dependency:
+`cargo install` does not work: the crate is not on crates.io, and it takes
+`zentinel-agent-protocol` through a path dependency. To build from source,
+check out [zentinel](https://github.com/zentinelproxy/zentinel) next to this
+repository:
 
 ```bash
 git clone https://github.com/zentinelproxy/zentinel
@@ -58,223 +119,82 @@ cd zentinel-agent-lua
 cargo build --release
 ```
 
-## Usage
+## Configuration
 
-```bash
-zentinel-lua-agent --socket /var/run/zentinel/lua.sock \
-  --scripts /etc/zentinel/scripts
-```
+| Option | Default | Meaning |
+|---|---|---|
+| `--script` / `LUA_SCRIPT` | required | Lua file to load at startup |
+| `--socket` / `AGENT_SOCKET` | `/tmp/zentinel-lua.sock` | Unix socket to listen on |
+| `--grpc-address` / `GRPC_ADDRESS` | none | Also listen on gRPC (e.g. `127.0.0.1:50051`), in addition to the socket |
+| `--fail-open` / `FAIL_OPEN` | `false` | On a script error, allow (tags `lua`, `error`, `fail_open`) instead of blocking with `500` |
+| `--verbose`, `-v` / `LUA_VERBOSE` | `false` | Debug logging |
+| `--max-memory-mb` / `LUA_MAX_MEMORY_MB` | `64` | Lua heap limit (unreleased, `main` only) |
+| `--max-instructions` / `LUA_MAX_INSTRUCTIONS` | `1000000` | Instructions per call, checked every 1000; `0` is unlimited (unreleased, `main` only) |
 
-### Command Line Options
+The script is read once; restart the agent to change it. The proxy does not
+forward an agent block's `config { }` to the agent, so use the flags above.
 
-| Option | Environment Variable | Description | Default |
-|--------|---------------------|-------------|---------|
-| `--socket` | `AGENT_SOCKET` | Unix socket path | `/tmp/zentinel-lua.sock` |
-| `--scripts` | `LUA_SCRIPTS_DIR` | Scripts directory | `/etc/zentinel/scripts` |
-| `--config` | `LUA_CONFIG` | Configuration file | - |
-| `--log-level` | `RUST_LOG` | Log level | `info` |
+### Script API
 
-## Writing Scripts
+`request` has `method`, `uri` (path and query), `client_ip`, `correlation_id`
+and `headers`; `response` has `status`, `correlation_id` and `headers`.
+Header names are **lowercase** (`request.headers["user-agent"]`), repeated
+headers are joined with `", "`, and the request headers include the
+pseudo-headers `:method` and `:path`.
 
-### Script Structure
+The returned table:
+
+| Field | Meaning |
+|---|---|
+| `decision` | `"allow"` (default), `"block"` / `"deny"`, or `"redirect"` |
+| `status` | Status for block (default `403`) or redirect (default `302`) |
+| `body` | Response body for block; target URL for redirect (a redirect without one allows) |
+| `add_request_headers`, `remove_request_headers` | Table of headers to set / list of names to remove upstream (allow only) |
+| `add_response_headers`, `remove_response_headers` | The same for the response to the client (allow and block) |
+| `tags` | Audit tags |
 
 ```lua
--- name: my-script
--- version: 1.0.0
--- hook: request_headers
--- paths: /api/*
--- methods: GET, POST
--- priority: 100
-
-function on_request_headers(request)
-    -- Add custom header
-    request:add_header("X-Processed-By", "my-script")
-
-    -- Check authorization
-    local auth = request:get_header("Authorization")
-    if not auth then
-        zentinel.set_decision("block")
-        return
+function on_request_headers()
+    local ua = (request.headers["user-agent"] or ""):lower()
+    for _, bot in ipairs({ "sqlmap", "nikto", "masscan" }) do
+        if ua:find(bot, 1, true) then
+            return { decision = "block", status = 403, tags = { "bot-blocked", bot } }
+        end
     end
+    return { decision = "allow" }
+end
 
-    zentinel.set_decision("allow")
+function on_response_headers()
+    return { decision = "allow", add_response_headers = { ["X-Content-Type-Options"] = "nosniff" } }
 end
 ```
 
-### Available Hooks
-
-| Hook | Description |
-|------|-------------|
-| `on_request_headers(request)` | Called when request headers are received |
-| `on_request_body(request, body)` | Called when full request body is buffered |
-| `on_request_body_chunk(request, chunk, is_last)` | Called for each body chunk (streaming) |
-| `on_response_headers(response)` | Called when response headers are received |
-| `on_response_body(response, body)` | Called when full response body is buffered |
-
-### Request/Response API
-
-```lua
--- Request object
-request:get_header("name")           -- Get header value
-request:add_header("name", "value")  -- Add header
-request:remove_header("name")        -- Remove header
-request:get_path()                   -- Get request path
-request:get_method()                 -- Get HTTP method
-request:get_query()                  -- Get query string
-request:get_source_ip()              -- Get client IP
-
--- Response object
-response:get_status()                -- Get status code
-response:get_header("name")          -- Get header value
-response:add_header("name", "value") -- Add header
-response:remove_header("name")       -- Remove header
-```
-
-### Standard Library
-
-#### JSON
-```lua
-local obj = json.decode('{"key": "value"}')
-local str = json.encode({key = "value"})
-local pretty = json.encode_pretty(obj)
-```
-
-#### Crypto
-```lua
-local hash = crypto.sha256("data")
-local hash384 = crypto.sha384("data")
-local hash512 = crypto.sha512("data")
-local mac = crypto.hmac_sha256("key", "message")
-local bytes = crypto.random_bytes(32)
-local hex = crypto.random_hex(16)
-```
-
-#### HTTP Utilities
-```lua
-local encoded = http.url_encode("hello world")
-local decoded = http.url_decode("hello%20world")
-local params = http.parse_query("foo=bar&baz=qux")
-local query = http.build_query({foo = "bar"})
-local cookies = http.parse_cookies(cookie_header)
-local text = http.status_text(200)  -- "OK"
-```
-
-#### Encoding
-```lua
-local b64 = encoding.base64_encode("data")
-local data = encoding.base64_decode(b64)
-local hex = encoding.hex_encode("data")
-local data = encoding.hex_decode(hex)
-local compressed = encoding.gzip_compress("data")
-local data = encoding.gzip_decompress(compressed)
-```
-
-#### Regex
-```lua
-local matched = regex.match("^hello", "hello world")
-local found = regex.find("\\d+", "value: 42")
-local all = regex.find_all("\\d+", "1 2 3")
-local replaced = regex.replace("\\d+", "value: 42", "X")
-```
-
-#### Time
-```lua
-local now = time.now()           -- Unix timestamp
-local now_ms = time.now_ms()     -- Milliseconds
-local formatted = time.format(now, "%Y-%m-%d")
-local ts = time.parse("2024-01-01", "%Y-%m-%d")
-```
-
-#### Zentinel
-```lua
-zentinel.log("info", "message")
-zentinel.set_decision("allow")   -- or "block", "redirect"
-zentinel.add_metadata("key", "value")
-zentinel.version                 -- Agent version
-```
-
-## Configuration
-
-### Zentinel Proxy Configuration
-
-```kdl
-agents {
-    agent "lua" {
-        type "custom"
-        unix-socket "/var/run/zentinel/lua.sock"
-        events "request_headers" "response_headers"
-        timeout-ms 100
-        failure-mode "open"
-    }
-}
-```
-
-### Agent Configuration (KDL)
-
-```kdl
-socket-path "/var/run/zentinel/lua.sock"
-
-scripts {
-    directory "/etc/zentinel/scripts"
-    hot-reload #true
-    watch-interval 5
-    timeout 100
-    cache-size 200
-}
-
-vm-pool {
-    size 20
-    max-age 600
-    max-executions 5000
-}
-
-resource-limits {
-    max-memory 52428800      // 50MB
-    max-instructions 10000000
-    max-execution-time 200
-    allow-filesystem #false
-    allow-network #false
-}
-
-safety {
-    fail-open #true
-    debug-scripts #false
-    max-concurrent 200
-}
-```
-
-## Resource Limits
-
-The agent configures these resource limits on Lua execution. **Note:** Memory and CPU instruction limits are defined but not yet enforced at runtime. Execution time is bounded by the agent protocol timeout.
-
-| Limit | Default | Status |
-|-------|---------|--------|
-| Memory | 50MB | Configured, not enforced |
-| Instructions | 10M | Configured, not enforced |
-| Execution time | 100ms | Bounded by agent timeout |
-| String length | 10MB | Configured, not enforced |
-| Table size | 10,000 | Configured, not enforced |
-
-## Security
-
-Scripts run in a sandboxed environment with:
-
-- No filesystem access (by default)
-- No network access (by default)
-- No process spawning
-- Dangerous functions removed (dofile, loadfile, etc.)
-- Limited libraries (string, table, math, utf8, coroutine)
+There is no Zentinel-specific library (no `json`, `crypto`, `http`, `regex`
+or `zentinel` modules); use plain Lua.
 
 ## Development
 
-```bash
-# Run with debug logging
-RUST_LOG=debug cargo run -- --socket /tmp/test.sock --scripts ./scripts
+CI clones `zentinel` next to the repository before building; do the same locally.
 
-# Run tests
+```bash
 cargo test
+cargo clippy --all-targets -- -D warnings
 ```
+
+## Related
+
+- [Registry page](https://registry.zentinelproxy.io/lua/)
+- [Agent configuration](https://docs.zentinelproxy.io/configuration/agents/)
+- [Agent protocol v2](https://docs.zentinelproxy.io/agents/v2/)
+- [JavaScript agent](https://github.com/zentinelproxy/zentinel-agent-js), the same model in JavaScript
+- [Zentinel](https://github.com/zentinelproxy/zentinel)
 
 ## License
 
-Apache-2.0
+Apache-2.0, see [`LICENSE`](LICENSE).
+
+---
+
+<p align="center">
+  <sub>Part of <a href="https://zentinelproxy.io">Zentinel</a>, the security-first reverse proxy. The shisa guards the gate.</sub>
+</p>
