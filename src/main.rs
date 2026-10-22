@@ -10,9 +10,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::sync::RwLock;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use tracing::{debug, error, info, warn};
 
 use zentinel_agent_protocol::v2::{
@@ -58,6 +57,12 @@ struct Args {
     max_instructions: u32,
 }
 
+/// Lock a mutex, recovering from poisoning (a panic while holding it leaves
+/// the VM itself usable).
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Lua script result
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ScriptResult {
@@ -100,17 +105,217 @@ struct LuaConfigJson {
     /// Inline Lua script content
     #[serde(default)]
     script: Option<String>,
-    /// Fail open on script errors
+    /// Fail open on script errors (overrides `--fail-open` when present)
     #[serde(default)]
-    fail_open: bool,
+    fail_open: Option<bool>,
+}
+
+/// Error message raised when a script runs past its instruction budget.
+const INSTRUCTION_LIMIT_ERROR: &str = "Script exceeded instruction limit";
+
+/// Standard libraries a script may use. `io`, `os`, `package` (and with it
+/// `require`), `debug` and `coroutine` are not loaded: the first four reach
+/// outside the VM, and `coroutine.resume` would catch the instruction-limit
+/// error.
+fn safe_std_libs() -> mlua::StdLib {
+    mlua::StdLib::STRING | mlua::StdLib::TABLE | mlua::StdLib::MATH | mlua::StdLib::UTF8
+}
+
+/// Runs after the standard libraries are loaded and before any script.
+///
+/// - Removes the base-library functions that read files (`dofile`,
+///   `loadfile`) and anything `require`-related that may be present.
+/// - Restricts `load` to text chunks (binary chunks can corrupt the VM).
+/// - Wraps `pcall`/`xpcall` so a script cannot catch the instruction-limit
+///   error and keep running: once the budget is spent, they re-raise.
+const SANDBOX_PRELUDE: &str = r##"
+local raw_pcall, raw_xpcall, raw_load, exceeded, error, select = ...
+dofile = nil
+loadfile = nil
+require = nil
+package = nil
+local function check(...)
+    if exceeded() then
+        error("Script exceeded instruction limit", 0)
+    end
+    return ...
+end
+pcall = function(...) return check(raw_pcall(...)) end
+xpcall = function(...) return check(raw_xpcall(...)) end
+load = function(chunk, chunkname, _mode, ...)
+    if select("#", ...) > 0 then
+        return raw_load(chunk, chunkname, "t", ...)
+    end
+    return raw_load(chunk, chunkname, "t")
+end
+"##;
+
+/// A Lua VM with only the safe standard libraries, a memory limit, and an
+/// instruction budget applied around every call into script code.
+struct Sandbox {
+    lua: Lua,
+    /// Set once the current call has spent its instruction budget.
+    exceeded: Arc<AtomicBool>,
+    max_instructions: u32,
+}
+
+impl Sandbox {
+    fn new(memory_limit: usize, max_instructions: u32) -> Result<Self> {
+        let lua = Lua::new_with(safe_std_libs(), LuaOptions::default())
+            .map_err(|e| anyhow::anyhow!("Failed to create Lua state: {}", e))?;
+        lua.set_memory_limit(memory_limit)?;
+
+        let exceeded = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&exceeded);
+        let exceeded_fn = lua.create_function(move |_, ()| Ok(flag.load(Ordering::Relaxed)))?;
+        let globals = lua.globals();
+        lua.load(SANDBOX_PRELUDE)
+            .set_name("=sandbox")
+            .call::<()>((
+                globals.get::<LuaFunction>("pcall")?,
+                globals.get::<LuaFunction>("xpcall")?,
+                globals.get::<LuaFunction>("load")?,
+                exceeded_fn,
+                globals.get::<LuaFunction>("error")?,
+                globals.get::<LuaFunction>("select")?,
+            ))
+            .map_err(|e| anyhow::anyhow!("Failed to initialise Lua sandbox: {}", e))?;
+
+        Ok(Self {
+            lua,
+            exceeded,
+            max_instructions,
+        })
+    }
+
+    /// Create a sandbox and run a script's top-level code in it, under the
+    /// memory and instruction limits.
+    fn load(script: &str, name: &str, memory_limit: usize, max_instructions: u32) -> Result<Self> {
+        let sandbox = Self::new(memory_limit, max_instructions)?;
+        sandbox
+            .limited(|lua| lua.load(script).set_name(name).exec())
+            .map_err(|e| anyhow::anyhow!("Failed to load script {}: {}", name, e))?;
+        Ok(sandbox)
+    }
+
+    /// Run `f` with the instruction budget installed; the hook is removed
+    /// afterwards whether or not `f` succeeded.
+    fn limited<R>(&self, f: impl FnOnce(&Lua) -> LuaResult<R>) -> LuaResult<R> {
+        self.exceeded.store(false, Ordering::Relaxed);
+        if self.max_instructions > 0 {
+            let max = self.max_instructions;
+            let counter = AtomicU32::new(0);
+            let flag = Arc::clone(&self.exceeded);
+            self.lua.set_hook(
+                mlua::HookTriggers::new().every_nth_instruction(1000),
+                move |_lua, _debug| {
+                    let count = counter.fetch_add(1000, Ordering::Relaxed);
+                    if count >= max {
+                        flag.store(true, Ordering::Relaxed);
+                        Err(mlua::Error::RuntimeError(
+                            INSTRUCTION_LIMIT_ERROR.to_string(),
+                        ))
+                    } else {
+                        Ok(mlua::VmState::Continue)
+                    }
+                },
+            );
+        }
+        let result = f(&self.lua);
+        self.lua.remove_hook();
+        let exceeded = self.exceeded.swap(false, Ordering::Relaxed);
+        match result {
+            // A script that swallowed the limit error some other way still fails.
+            Ok(_) if exceeded => Err(mlua::Error::RuntimeError(
+                INSTRUCTION_LIMIT_ERROR.to_string(),
+            )),
+            other => other,
+        }
+    }
+}
+
+fn lua_err(e: mlua::Error) -> anyhow::Error {
+    anyhow::anyhow!("Lua error: {}", e)
+}
+
+fn execute_request_script(sandbox: &Sandbox, event: &RequestHeadersEvent) -> Result<ScriptResult> {
+    sandbox
+        .limited(|lua| {
+            // Create request table
+            let request_table = lua.create_table()?;
+            request_table.set("method", event.method.clone())?;
+            request_table.set("uri", event.uri.clone())?;
+            request_table.set("client_ip", event.metadata.client_ip.clone())?;
+            request_table.set("correlation_id", event.metadata.correlation_id.clone())?;
+
+            // Convert headers to Lua table
+            let headers_table = lua.create_table()?;
+            for (name, values) in &event.headers {
+                // Join multiple values with comma
+                headers_table.set(name.clone(), values.join(", "))?;
+            }
+            request_table.set("headers", headers_table)?;
+
+            // Set global request
+            lua.globals().set("request", request_table)?;
+
+            // Call on_request_headers if it exists
+            match lua
+                .globals()
+                .get::<Option<LuaFunction>>("on_request_headers")?
+            {
+                Some(func) => func.call::<LuaValue>(()),
+                None => Ok(LuaValue::Nil),
+            }
+        })
+        .map_err(lua_err)
+        .and_then(LuaAgent::script_result)
+}
+
+fn execute_response_script(
+    sandbox: &Sandbox,
+    event: &ResponseHeadersEvent,
+) -> Result<ScriptResult> {
+    sandbox
+        .limited(|lua| {
+            // Create response table
+            let response_table = lua.create_table()?;
+            response_table.set("status", event.status)?;
+            response_table.set("correlation_id", event.correlation_id.clone())?;
+
+            // Convert headers to Lua table
+            let headers_table = lua.create_table()?;
+            for (name, values) in &event.headers {
+                headers_table.set(name.clone(), values.join(", "))?;
+            }
+            response_table.set("headers", headers_table)?;
+
+            // Set global response
+            lua.globals().set("response", response_table)?;
+
+            // Call on_response_headers if it exists
+            match lua
+                .globals()
+                .get::<Option<LuaFunction>>("on_response_headers")?
+            {
+                Some(func) => func.call::<LuaValue>(()),
+                None => Ok(LuaValue::Nil),
+            }
+        })
+        .map_err(lua_err)
+        .and_then(LuaAgent::script_result)
 }
 
 /// Lua agent with v2 protocol support
 pub struct LuaAgent {
-    lua: Arc<RwLock<Lua>>,
+    /// The script's VM. A `Mutex`, not an `RwLock`: a call sets the global
+    /// `request`/`response` and installs a per-call instruction hook, so two
+    /// calls must not interleave on one VM. Only locked inside
+    /// `spawn_blocking`, never on an async worker thread.
+    sandbox: Arc<Mutex<Sandbox>>,
     #[allow(dead_code)]
     script_path: PathBuf,
-    fail_open: bool,
+    fail_open: AtomicBool,
     /// Memory limit in bytes
     memory_limit: usize,
     /// Max instructions per execution (0 = unlimited)
@@ -133,29 +338,26 @@ impl LuaAgent {
         memory_limit: usize,
         max_instructions: u32,
     ) -> Result<Self> {
-        let lua = Lua::new();
-
-        // Set memory limit
-        lua.set_memory_limit(memory_limit)?;
-        info!(
-            memory_limit_mb = memory_limit / (1024 * 1024),
-            "Lua memory limit set"
-        );
-
         // Load the script
         let script_content = std::fs::read_to_string(&script_path)
             .with_context(|| format!("Failed to read script: {:?}", script_path))?;
 
-        lua.load(&script_content)
-            .exec()
-            .map_err(|e| anyhow::anyhow!("Failed to load script {:?}: {}", script_path, e))?;
-
+        let sandbox = Sandbox::load(
+            &script_content,
+            &format!("@{}", script_path.display()),
+            memory_limit,
+            max_instructions,
+        )?;
+        info!(
+            memory_limit_mb = memory_limit / (1024 * 1024),
+            max_instructions, "Lua memory and instruction limits set"
+        );
         info!(script = ?script_path, "Lua script loaded successfully");
 
         Ok(Self {
-            lua: Arc::new(RwLock::new(lua)),
+            sandbox: Arc::new(Mutex::new(sandbox)),
             script_path,
-            fail_open,
+            fail_open: AtomicBool::new(fail_open),
             memory_limit,
             max_instructions,
             requests_total: AtomicU64::new(0),
@@ -165,184 +367,54 @@ impl LuaAgent {
         })
     }
 
-    /// Load a new Lua script from content string
-    fn load_script_content(&self, script_content: &str) -> Result<()> {
-        let mut lua = self.lua.write().unwrap();
+    fn fail_open(&self) -> bool {
+        self.fail_open.load(Ordering::Relaxed)
+    }
 
-        // Create a new Lua state
-        let new_lua = Lua::new();
+    /// Load a new Lua script from content string. The new VM is built (and
+    /// the script's top-level code run, under the limits) without holding the
+    /// lock; the lock is only taken to swap it in.
+    async fn load_script_content(&self, script_content: &str) -> Result<()> {
+        let script = script_content.to_string();
+        let (memory_limit, max_instructions) = (self.memory_limit, self.max_instructions);
+        let new_sandbox = tokio::task::spawn_blocking(move || {
+            Sandbox::load(&script, "=config", memory_limit, max_instructions)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Script load task failed: {}", e))??;
 
-        // Reapply memory limit
-        new_lua.set_memory_limit(self.memory_limit)?;
-
-        // Load the script
-        new_lua
-            .load(script_content)
-            .exec()
-            .map_err(|e| anyhow::anyhow!("Failed to load script: {}", e))?;
-
-        // Replace the old state with the new one
-        *lua = new_lua;
+        *lock(&self.sandbox) = new_sandbox;
 
         info!("Lua script loaded from configuration");
         Ok(())
     }
 
-    /// Set instruction count hook for CPU limiting.
-    fn set_instruction_hook(&self, lua: &Lua) {
-        if self.max_instructions == 0 {
-            return;
-        }
-        let max = self.max_instructions;
-        let counter = Arc::new(std::sync::atomic::AtomicU32::new(0));
-        let counter_clone = counter.clone();
-        lua.set_hook(
-            mlua::HookTriggers::new().every_nth_instruction(1000),
-            move |_lua, _debug| {
-                let count = counter_clone.fetch_add(1000, std::sync::atomic::Ordering::Relaxed);
-                if count >= max {
-                    Err(mlua::Error::RuntimeError(
-                        "Script exceeded instruction limit".to_string(),
-                    ))
-                } else {
-                    Ok(mlua::VmState::Continue)
-                }
-            },
-        );
-    }
-
-    /// Remove instruction hook after execution.
-    fn remove_instruction_hook(&self, lua: &Lua) {
-        lua.remove_hook();
-    }
-
+    #[cfg(test)]
     fn execute_request_script(&self, event: &RequestHeadersEvent) -> Result<ScriptResult> {
-        let lua = self.lua.read().unwrap();
-
-        // Set instruction limit hook
-        self.set_instruction_hook(&lua);
-
-        // Create request table
-        let request_table = lua
-            .create_table()
-            .map_err(|e| anyhow::anyhow!("Lua error: {}", e))?;
-        request_table
-            .set("method", event.method.clone())
-            .map_err(|e| anyhow::anyhow!("Lua error: {}", e))?;
-        request_table
-            .set("uri", event.uri.clone())
-            .map_err(|e| anyhow::anyhow!("Lua error: {}", e))?;
-        request_table
-            .set("client_ip", event.metadata.client_ip.clone())
-            .map_err(|e| anyhow::anyhow!("Lua error: {}", e))?;
-        request_table
-            .set("correlation_id", event.metadata.correlation_id.clone())
-            .map_err(|e| anyhow::anyhow!("Lua error: {}", e))?;
-
-        // Convert headers to Lua table
-        let headers_table = lua
-            .create_table()
-            .map_err(|e| anyhow::anyhow!("Lua error: {}", e))?;
-        for (name, values) in &event.headers {
-            // Join multiple values with comma
-            let value = values.join(", ");
-            headers_table
-                .set(name.clone(), value)
-                .map_err(|e| anyhow::anyhow!("Lua error: {}", e))?;
-        }
-        request_table
-            .set("headers", headers_table)
-            .map_err(|e| anyhow::anyhow!("Lua error: {}", e))?;
-
-        // Set global request
-        lua.globals()
-            .set("request", request_table)
-            .map_err(|e| anyhow::anyhow!("Lua error: {}", e))?;
-
-        // Call on_request_headers if it exists
-        let func: Option<LuaFunction> = lua.globals().get("on_request_headers").ok();
-
-        let result = if let Some(func) = func {
-            let result: LuaValue = func
-                .call(())
-                .map_err(|e| anyhow::anyhow!("Lua error: {}", e))?;
-
-            // Parse result
-            if let LuaValue::Table(result_table) = result {
-                self.parse_script_result(&lua, result_table)
-            } else {
-                Ok(ScriptResult::default())
-            }
-        } else {
-            Ok(ScriptResult::default())
-        };
-
-        // Remove instruction hook after execution
-        self.remove_instruction_hook(&lua);
-
-        result
+        execute_request_script(&lock(&self.sandbox), event)
     }
 
-    fn execute_response_script(&self, event: &ResponseHeadersEvent) -> Result<ScriptResult> {
-        let lua = self.lua.read().unwrap();
-
-        // Set instruction limit hook
-        self.set_instruction_hook(&lua);
-
-        // Create response table
-        let response_table = lua
-            .create_table()
-            .map_err(|e| anyhow::anyhow!("Lua error: {}", e))?;
-        response_table
-            .set("status", event.status)
-            .map_err(|e| anyhow::anyhow!("Lua error: {}", e))?;
-        response_table
-            .set("correlation_id", event.correlation_id.clone())
-            .map_err(|e| anyhow::anyhow!("Lua error: {}", e))?;
-
-        // Convert headers to Lua table
-        let headers_table = lua
-            .create_table()
-            .map_err(|e| anyhow::anyhow!("Lua error: {}", e))?;
-        for (name, values) in &event.headers {
-            let value = values.join(", ");
-            headers_table
-                .set(name.clone(), value)
-                .map_err(|e| anyhow::anyhow!("Lua error: {}", e))?;
-        }
-        response_table
-            .set("headers", headers_table)
-            .map_err(|e| anyhow::anyhow!("Lua error: {}", e))?;
-
-        // Set global response
-        lua.globals()
-            .set("response", response_table)
-            .map_err(|e| anyhow::anyhow!("Lua error: {}", e))?;
-
-        // Call on_response_headers if it exists
-        let func: Option<LuaFunction> = lua.globals().get("on_response_headers").ok();
-
-        let result = if let Some(func) = func {
-            let result: LuaValue = func
-                .call(())
-                .map_err(|e| anyhow::anyhow!("Lua error: {}", e))?;
-
-            if let LuaValue::Table(result_table) = result {
-                self.parse_script_result(&lua, result_table)
-            } else {
-                Ok(ScriptResult::default())
-            }
-        } else {
-            Ok(ScriptResult::default())
-        };
-
-        // Remove instruction hook after execution
-        self.remove_instruction_hook(&lua);
-
-        result
+    /// Run a script call on the blocking pool, so neither the lock nor the
+    /// script's execution ties up an async worker thread.
+    async fn run_blocking<E: Send + 'static>(
+        &self,
+        event: E,
+        f: fn(&Sandbox, &E) -> Result<ScriptResult>,
+    ) -> Result<ScriptResult> {
+        let sandbox = Arc::clone(&self.sandbox);
+        tokio::task::spawn_blocking(move || f(&lock(&sandbox), &event))
+            .await
+            .map_err(|e| anyhow::anyhow!("Script task failed: {}", e))?
     }
 
-    fn parse_script_result(&self, _lua: &Lua, table: LuaTable) -> Result<ScriptResult> {
+    fn script_result(value: LuaValue) -> Result<ScriptResult> {
+        match value {
+            LuaValue::Table(table) => Self::parse_script_result(table),
+            _ => Ok(ScriptResult::default()),
+        }
+    }
+
+    fn parse_script_result(table: LuaTable) -> Result<ScriptResult> {
         let mut result = ScriptResult::default();
 
         // Parse decision
@@ -498,23 +570,31 @@ impl AgentHandlerV2 for LuaAgent {
             }
         };
 
+        let fail_open = lua_config.fail_open.unwrap_or_else(|| self.fail_open());
+
         // Load script if provided in config
         if let Some(script_content) = &lua_config.script {
             debug!("Loading Lua script from configuration");
-            if let Err(e) = self.load_script_content(script_content) {
+            if let Err(e) = self.load_script_content(script_content).await {
                 error!("Failed to load Lua script from config: {}", e);
-                return !lua_config.fail_open;
+                if !fail_open {
+                    // Fail closed: refuse the configuration.
+                    return false;
+                }
+                warn!("Fail-open: accepting configuration, keeping the previous script");
+            } else {
+                info!("Lua script loaded successfully from configuration");
             }
-            info!("Lua script loaded successfully from configuration");
         }
 
+        self.fail_open.store(fail_open, Ordering::Relaxed);
         true
     }
 
     async fn on_request_headers(&self, event: RequestHeadersEvent) -> AgentResponse {
         self.requests_total.fetch_add(1, Ordering::Relaxed);
 
-        match self.execute_request_script(&event) {
+        match self.run_blocking(event, execute_request_script).await {
             Ok(result) => {
                 debug!(decision = %result.decision, "Lua script executed");
                 let response = self.build_response(result.clone());
@@ -534,7 +614,7 @@ impl AgentHandlerV2 for LuaAgent {
                 error!("Lua script error: {}", e);
                 self.script_errors.fetch_add(1, Ordering::Relaxed);
 
-                if self.fail_open {
+                if self.fail_open() {
                     warn!("Failing open due to script error");
                     self.requests_allowed.fetch_add(1, Ordering::Relaxed);
                     AgentResponse::default_allow().with_audit(AuditMetadata {
@@ -560,7 +640,7 @@ impl AgentHandlerV2 for LuaAgent {
     }
 
     async fn on_response_headers(&self, event: ResponseHeadersEvent) -> AgentResponse {
-        match self.execute_response_script(&event) {
+        match self.run_blocking(event, execute_response_script).await {
             Ok(result) => {
                 debug!(decision = %result.decision, "Lua response script executed");
                 self.build_response(result)
@@ -569,7 +649,7 @@ impl AgentHandlerV2 for LuaAgent {
                 error!("Lua response script error: {}", e);
                 self.script_errors.fetch_add(1, Ordering::Relaxed);
 
-                if self.fail_open {
+                if self.fail_open() {
                     AgentResponse::default_allow()
                 } else {
                     AgentResponse::block(500, Some("Script execution error".to_string()))
@@ -969,5 +1049,292 @@ mod tests {
         assert_eq!(report.agent_id, "zentinel-lua-agent");
         assert!(!report.counters.is_empty());
         assert!(!report.gauges.is_empty());
+    }
+
+    fn request_event(uri: &str) -> RequestHeadersEvent {
+        RequestHeadersEvent {
+            metadata: zentinel_agent_protocol::RequestMetadata {
+                correlation_id: "test-123".to_string(),
+                request_id: "req-456".to_string(),
+                client_ip: "127.0.0.1".to_string(),
+                client_port: 12345,
+                server_name: None,
+                protocol: "HTTP/1.1".to_string(),
+                tls_version: None,
+                tls_cipher: None,
+                route_id: None,
+                upstream_id: None,
+                timestamp: "2024-01-01T00:00:00Z".to_string(),
+                traceparent: None,
+            },
+            method: "GET".to_string(),
+            uri: uri.to_string(),
+            headers: HashMap::new(),
+        }
+    }
+
+    fn agent_with(script: &str, fail_open: bool) -> Result<LuaAgent> {
+        let file = create_test_script(script);
+        LuaAgent::with_limits(
+            file.path().to_path_buf(),
+            fail_open,
+            64 * 1024 * 1024,
+            100_000,
+        )
+    }
+
+    fn block_status(response: &AgentResponse) -> Option<u16> {
+        match &response.decision {
+            zentinel_agent_protocol::Decision::Block { status, .. } => Some(*status),
+            _ => None,
+        }
+    }
+
+    /// Reports, as tags, every dangerous global or library function that is
+    /// reachable from a script.
+    const PROBE_SCRIPT: &str = r#"
+        local function reachable()
+            local found = {}
+            local function probe(name, value)
+                if value ~= nil then table.insert(found, name) end
+            end
+            probe("io", io)
+            probe("os", os)
+            probe("package", package)
+            probe("require", require)
+            probe("dofile", dofile)
+            probe("loadfile", loadfile)
+            probe("debug", debug)
+            probe("coroutine", coroutine)
+            probe("os.execute", os and os.execute)
+            probe("io.open", io and io.open)
+            probe("io.popen", io and io.popen)
+            -- load must refuse binary chunks
+            local ok_bin = load(string.dump(function() return 1 end))
+            probe("load(binary)", ok_bin)
+            -- and must still accept text chunks
+            if load("return 1")() ~= 1 then table.insert(found, "load(text) broken") end
+            return found
+        end
+        load_time = reachable()
+        function on_request_headers()
+            local tags = {}
+            for _, v in ipairs(load_time) do table.insert(tags, "load:" .. v) end
+            for _, v in ipairs(reachable()) do table.insert(tags, "call:" .. v) end
+            return { decision = "allow", tags = tags }
+        end
+    "#;
+
+    #[test]
+    fn test_sandbox_dangerous_globals_unavailable_from_file_script() {
+        let agent = agent_with(PROBE_SCRIPT, false).unwrap();
+        let result = agent.execute_request_script(&request_event("/")).unwrap();
+        assert_eq!(result.tags, Vec::<String>::new());
+    }
+
+    #[test]
+    fn test_sandbox_dangerous_calls_fail() {
+        for call in [
+            r#"os.execute("true")"#,
+            r#"io.open("/etc/passwd")"#,
+            r#"require("os")"#,
+            r#"dofile("/etc/passwd")"#,
+            r#"loadfile("/etc/passwd")"#,
+        ] {
+            let err = agent_with(call, false).err().unwrap().to_string();
+            assert!(err.contains("attempt to"), "{call}: {err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sandbox_applies_to_inline_config_script() {
+        let agent = agent_with("function on_request_headers() end", false).unwrap();
+        let accepted = agent
+            .on_configure(serde_json::json!({ "script": PROBE_SCRIPT }), None)
+            .await;
+        assert!(accepted);
+        let response = agent.on_request_headers(request_event("/")).await;
+        assert_eq!(block_status(&response), None);
+        assert!(response.audit.tags.is_empty(), "{:?}", response.audit.tags);
+    }
+
+    #[test]
+    fn test_instruction_limit_stops_infinite_loop_at_load() {
+        let err = agent_with("while true do end", false)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains(INSTRUCTION_LIMIT_ERROR), "{err}");
+    }
+
+    #[test]
+    fn test_instruction_limit_cannot_be_caught_with_pcall() {
+        for script in [
+            "while true do pcall(function() while true do end end) end",
+            "while true do xpcall(function() while true do end end, function(e) return e end) end",
+            "local ok = pcall(function() while true do end end)",
+        ] {
+            let err = agent_with(script, false).err().unwrap().to_string();
+            assert!(err.contains(INSTRUCTION_LIMIT_ERROR), "{script}: {err}");
+        }
+    }
+
+    #[test]
+    fn test_memory_limit_applies_at_load() {
+        let file = create_test_script(r#"big = string.rep("x", 8 * 1024 * 1024)"#);
+        let err = LuaAgent::with_limits(file.path().to_path_buf(), false, 4 * 1024 * 1024, 0)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.to_lowercase().contains("memory"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_instruction_limit_stops_infinite_loop_in_inline_config_script() {
+        let agent = agent_with(
+            r#"function on_request_headers() return { decision = "block", status = 418 } end"#,
+            false,
+        )
+        .unwrap();
+        let accepted = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            agent.on_configure(serde_json::json!({ "script": "while true do end" }), None),
+        )
+        .await
+        .expect("load-time infinite loop must be stopped");
+        assert!(
+            !accepted,
+            "fail-closed: a script that fails to load is refused"
+        );
+        // Previous script is still in place.
+        let response = agent.on_request_headers(request_event("/")).await;
+        assert_eq!(block_status(&response), Some(418));
+    }
+
+    #[tokio::test]
+    async fn test_instruction_limit_at_request_time_then_recovers() {
+        let agent = agent_with(
+            r#"
+            function on_request_headers()
+                if request.uri == "/spin" then while true do end end
+                return { decision = "allow" }
+            end
+            "#,
+            false,
+        )
+        .unwrap();
+        let response = agent.on_request_headers(request_event("/spin")).await;
+        assert_eq!(block_status(&response), Some(500));
+        let response = agent.on_request_headers(request_event("/")).await;
+        assert_eq!(block_status(&response), None);
+    }
+
+    const ERRORING_SCRIPT: &str = r#"
+        function on_request_headers() error("boom") end
+        function on_response_headers() error("boom") end
+    "#;
+
+    #[tokio::test]
+    async fn test_script_error_fail_closed_blocks_500() {
+        let agent = agent_with(ERRORING_SCRIPT, false).unwrap();
+        let response = agent.on_request_headers(request_event("/")).await;
+        assert_eq!(block_status(&response), Some(500));
+        assert_eq!(agent.requests_blocked.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn test_script_error_fail_open_allows() {
+        let agent = agent_with(ERRORING_SCRIPT, true).unwrap();
+        let response = agent.on_request_headers(request_event("/")).await;
+        assert_eq!(block_status(&response), None);
+        assert!(response.audit.tags.contains(&"fail_open".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_configure_load_failure_fail_closed_refuses() {
+        let agent = agent_with(
+            r#"function on_request_headers() return { decision = "block", status = 418 } end"#,
+            false,
+        )
+        .unwrap();
+        let accepted = agent
+            .on_configure(serde_json::json!({ "script": "this is not lua" }), None)
+            .await;
+        assert!(!accepted);
+        let accepted = agent
+            .on_configure(
+                serde_json::json!({ "script": "this is not lua", "fail-open": false }),
+                None,
+            )
+            .await;
+        assert!(!accepted);
+        assert!(!agent.fail_open());
+        let response = agent.on_request_headers(request_event("/")).await;
+        assert_eq!(block_status(&response), Some(418));
+    }
+
+    #[tokio::test]
+    async fn test_configure_load_failure_fail_open_accepts_and_keeps_script() {
+        let agent = agent_with(
+            r#"function on_request_headers() return { decision = "block", status = 418 } end"#,
+            false,
+        )
+        .unwrap();
+        let accepted = agent
+            .on_configure(
+                serde_json::json!({ "script": "this is not lua", "fail-open": true }),
+                None,
+            )
+            .await;
+        assert!(accepted);
+        assert!(agent.fail_open());
+        let response = agent.on_request_headers(request_event("/")).await;
+        assert_eq!(block_status(&response), Some(418));
+    }
+
+    #[tokio::test]
+    async fn test_configure_fail_open_governs_request_errors() {
+        let agent = agent_with(ERRORING_SCRIPT, false).unwrap();
+        assert!(
+            agent
+                .on_configure(serde_json::json!({ "fail-open": true }), None)
+                .await
+        );
+        let response = agent.on_request_headers(request_event("/")).await;
+        assert_eq!(block_status(&response), None);
+
+        // Omitting the key keeps the current setting (here: the CLI value).
+        let agent = agent_with(ERRORING_SCRIPT, true).unwrap();
+        assert!(agent.on_configure(serde_json::json!({}), None).await);
+        assert!(agent.fail_open());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_requests_see_their_own_request() {
+        let agent = Arc::new(
+            agent_with(
+                r#"
+                function on_request_headers()
+                    local uri = request.uri
+                    for i = 1, 2000 do end
+                    return { decision = "allow", tags = { uri, request.uri } }
+                end
+                "#,
+                false,
+            )
+            .unwrap(),
+        );
+        let mut handles = Vec::new();
+        for i in 0..64 {
+            let agent = Arc::clone(&agent);
+            handles.push(tokio::spawn(async move {
+                let uri = format!("/{i}");
+                let response = agent.on_request_headers(request_event(&uri)).await;
+                assert_eq!(response.audit.tags, vec![uri.clone(), uri]);
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
     }
 }

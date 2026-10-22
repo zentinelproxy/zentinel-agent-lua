@@ -32,8 +32,12 @@ function the script does not define allows. A script error blocks with `500`
 unless the agent runs with `--fail-open`; if the agent itself is unreachable,
 the filter's `failure-mode` decides.
 
-The script runs with Lua's standard libraries, including `io` and `os`. It is
-not sandboxed: treat it as code with the agent's privileges.
+Scripts run in a sandbox: only the `string`, `table`, `math` and `utf8`
+libraries and the safe base functions are available. `io`, `os`, `package`,
+`require`, `dofile`, `loadfile`, `debug` and `coroutine` are not, and `load`
+accepts text chunks only. The memory and instruction limits apply from the
+first instruction, including the script's top-level code at load time, and
+`pcall`/`xpcall` cannot catch the instruction-limit error.
 
 ## Quick start
 
@@ -131,8 +135,13 @@ cargo build --release
 | `--max-memory-mb` / `LUA_MAX_MEMORY_MB` | `64` | Lua heap limit (unreleased, `main` only) |
 | `--max-instructions` / `LUA_MAX_INSTRUCTIONS` | `1000000` | Instructions per call, checked every 1000; `0` is unlimited (unreleased, `main` only) |
 
-The script is read once; restart the agent to change it. The proxy does not
-forward an agent block's `config { }` to the agent, so use the flags above.
+The script is read once; restart the agent to change it. A configure event
+may also carry `script` (inline Lua, loaded into a fresh sandbox under the same
+limits and swapped in only if it loads) and `fail-open` (overrides
+`--fail-open` when present). If an inline script fails to load, the agent
+keeps its previous script and refuses the configuration, or accepts it when
+fail-open is in effect. The current proxy does not yet forward an agent block's
+`config { }` (zentinel#593), so use the flags above.
 
 ### Script API
 
