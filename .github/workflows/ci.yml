@@ -81,3 +81,25 @@ jobs:
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - run: cargo test --workspace
+
+  # The release pipeline on one platform, without publishing: builds the
+  # release binary with --locked and runs scripts/smoke-test.sh behind the
+  # latest Zentinel release, so a change that would break a release fails
+  # here first. Switch both refs to v1 once zentinelproxy/.github is tagged.
+  smoke:
+    name: Smoke
+    uses: zentinelproxy/.github/.github/workflows/agent-release.yml@ci/agent-release
+    permissions:
+      contents: read
+    with:
+      binary: zentinel-lua-agent
+      # zentinel-agent-protocol and zentinel-common are path dependencies on
+      # ../zentinel. Pin the commit Cargo.lock was generated against, so the
+      # tag always builds the same thing; bump it together with Cargo.lock.
+      # (Moving to the crates.io releases, as the auth agent does, would make
+      # this unnecessary.)
+      siblings: zentinelproxy/zentinel@3bcfe23e98c126112ba232182d1619c5491e1015
+      smoke-command: scripts/smoke-test.sh
+      harness-ref: ci/agent-release
+      platforms: '["linux-x86_64"]'
+      cache: true
