@@ -26,7 +26,7 @@ permissions:
 
 jobs:
   release:
-    uses: zentinelproxy/.github/.github/workflows/agent-release.yml@ci/agent-release
+    uses: zentinelproxy/.github/.github/workflows/agent-release.yml@v1
     with:
       binary: zentinel-lua-agent
       # zentinel-agent-protocol and zentinel-common are path dependencies on
@@ -36,4 +36,4 @@ jobs:
       # this unnecessary.)
       siblings: zentinelproxy/zentinel@3bcfe23e98c126112ba232182d1619c5491e1015
       smoke-command: scripts/smoke-test.sh
-      harness-ref: ci/agent-release
+      harness-ref: v1

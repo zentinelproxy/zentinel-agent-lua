@@ -88,7 +88,7 @@ jobs:
   # here first. Switch both refs to v1 once zentinelproxy/.github is tagged.
   smoke:
     name: Smoke
-    uses: zentinelproxy/.github/.github/workflows/agent-release.yml@ci/agent-release
+    uses: zentinelproxy/.github/.github/workflows/agent-release.yml@v1
     permissions:
       contents: read
     with:
@@ -100,6 +100,6 @@ jobs:
       # this unnecessary.)
       siblings: zentinelproxy/zentinel@3bcfe23e98c126112ba232182d1619c5491e1015
       smoke-command: scripts/smoke-test.sh
-      harness-ref: ci/agent-release
+      harness-ref: v1
       platforms: '["linux-x86_64"]'
       cache: true
