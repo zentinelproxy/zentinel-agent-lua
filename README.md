@@ -140,8 +140,12 @@ may also carry `script` (inline Lua, loaded into a fresh sandbox under the same
 limits and swapped in only if it loads) and `fail-open` (overrides
 `--fail-open` when present). If an inline script fails to load, the agent
 keeps its previous script and refuses the configuration, or accepts it when
-fail-open is in effect. The current proxy does not yet forward an agent block's
-`config { }` (zentinel#593), so use the flags above.
+fail-open is in effect. Zentinel 26.10_8 and later send the agent block's
+`config { }` to the agent on every connection (releases up to 0.6.50 never
+did, so the flags above were all there was; over gRPC only a build against
+`zentinel-agent-protocol` 0.6.51 or later receives it, which the current
+build against 0.6.50 is not). A configuration the agent refuses leaves it
+unused by Zentinel, and its filters' `failure-mode` applies.
 
 ### Script API
 
